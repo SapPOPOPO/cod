@@ -1,8 +1,10 @@
+import collections
 import numpy as np
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 
 from torch.utils.data import DataLoader, RandomSampler
@@ -522,6 +524,429 @@ class CoSeRecTrainer(Trainer):
                     recommend_output = recommend_output[:, -1, :]
                     test_logits = self.predict_sample(recommend_output, test_neg_items)
                     test_logits = test_logits.cpu().detach().numpy().copy()
+                    if i == 0:
+                        pred_list = test_logits
+                    else:
+                        pred_list = np.append(pred_list, test_logits, axis=0)
+                return self.get_sample_scores(epoch, pred_list)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASTARDiversityTrainer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ASTARDiversityTrainer(Trainer):
+    """Diversity-and-exploration augmenter trainer (ablation: ASTARDiversity).
+
+    Augmenter loss:
+        L_A = β  * L_rec_aug                  (info preservation)
+            + diversity_w * L_strategy_diversity  (−EMD vs past strategies)
+            + view_div_w  * L_view_divergence     (−JSD between T1 and T2)
+            − η           * L_entropy(T1, T2)     (encourage non-degenerate T)
+
+    Recommender loss:
+        L_B = rec_weight * L_rec_orig + cf_weight * L_CL(view1, view2)
+    """
+
+    def __init__(self, model, adv_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args):
+        super().__init__(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args
+        )
+
+        self.beta         = getattr(args, 'astar_beta',        50.0)
+        self.warmup_epochs = getattr(args, 'warmup_epochs',    20)
+        self.max_grad_norm = getattr(args, 'max_grad_norm',    5.0)
+        self.item_similarity = getattr(args, 'item_similarity', None)
+
+        self.diversity_w  = getattr(args, 'diversity_weight',  0.1)
+        self.view_div_w   = getattr(args, 'view_div_weight',   0.1)
+        self.entropy_w    = getattr(args, 'entropy_weight',    0.01)
+        self.window_size  = getattr(args, 'strategy_window_size', 10)
+
+        # Sliding window of past strategy fingerprints (numpy arrays)
+        self._strategy_window = collections.deque(maxlen=self.window_size)
+        # Accumulate batch fingerprints within the current epoch
+        self._epoch_fingerprints: list = []
+
+        if self.cuda_condition:
+            self.adv_model.cuda()
+
+        self.analyzer = TMatrixAnalyzer(args, N_rand=args.N_rand, N_sim=args.N_sim)
+
+    # ── Pool-region helpers ───────────────────────────────────────────────────
+
+    def _pool_boundaries(self):
+        """Return (own_start, n_ops, op_names) for the current augmenter."""
+        m = self.adv_model
+        own_start = 1 + m.N_rand + m.N_sim + m.N_hist
+        op_names  = ['mask', 'random_sub']
+        if m.N_sim  > 0:
+            op_names.append('sim_sub')
+        if m.N_hist > 0:
+            op_names.append('hist_sub')
+        op_names += ['own_identity', 'own_shuffle']
+        return own_start, op_names
+
+    # ── Soft operation proportions (differentiable) ───────────────────────────
+
+    def _soft_op_dist(self, T: torch.Tensor, own_mask: torch.Tensor) -> torch.Tensor:
+        """Return soft operation distribution [B, n_ops] from T [B, P, L].
+
+        Each row sums to 1 and is differentiable w.r.t. T.
+        """
+        B, P, L    = T.shape
+        device     = T.device
+        m          = self.adv_model
+        own_start, op_names = self._pool_boundaries()
+
+        valid     = own_mask.float()              # [B, L]
+        T_w       = T * valid.unsqueeze(1)        # [B, P, L]  zero at padding
+        T_sum_pos = T_w.sum(dim=2)                # [B, P]  summed over output positions
+
+        total_w = T_sum_pos.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [B, 1]
+
+        parts = []
+
+        # mask
+        parts.append(T_sum_pos[:, 0:1])
+
+        # random_sub
+        rand_end = 1 + m.N_rand
+        parts.append(T_sum_pos[:, 1:rand_end].sum(dim=1, keepdim=True))
+
+        # sim_sub
+        if m.N_sim > 0:
+            sim_start = rand_end
+            sim_end   = sim_start + m.N_sim
+            parts.append(T_sum_pos[:, sim_start:sim_end].sum(dim=1, keepdim=True))
+
+        # hist_sub
+        if m.N_hist > 0:
+            hist_start = rand_end + m.N_sim
+            hist_end   = hist_start + m.N_hist
+            parts.append(T_sum_pos[:, hist_start:hist_end].sum(dim=1, keepdim=True))
+
+        # own_identity vs own_shuffle
+        T_own_pool = T_w[:, own_start:, :]        # [B, L_own, L]
+        L_own = T_own_pool.shape[1]
+        d     = min(L_own, L)
+        diag_indices  = torch.arange(d, device=device)
+
+        identity_w = T_own_pool[:, diag_indices, diag_indices].sum(dim=1, keepdim=True)  # [B, 1]
+        own_total  = T_sum_pos[:, own_start:].sum(dim=1, keepdim=True)   # [B, 1]
+        shuffle_w  = (own_total - identity_w).clamp(min=0.0)
+
+        parts.extend([identity_w, shuffle_w])
+
+        op_dist = torch.cat(parts, dim=1) / total_w   # [B, n_ops]
+        return op_dist
+
+    # ── Diversity losses ──────────────────────────────────────────────────────
+
+    def _emd_loss(self, op_dist: torch.Tensor) -> torch.Tensor:
+        """Wasserstein-1 (EMD) between current batch dist and window mean.
+
+        Returns −EMD (we want to *maximise* distance → minimise negative).
+        If the window is empty returns zero.
+        """
+        if len(self._strategy_window) == 0:
+            return op_dist.new_zeros(1).squeeze()
+
+        # Reference: mean of stored fingerprints (numpy → tensor)
+        ref_np  = np.stack(self._strategy_window, axis=0).mean(0)  # [n_ops]
+        ref     = torch.from_numpy(ref_np).to(dtype=op_dist.dtype, device=op_dist.device)
+
+        # Current: mean over batch
+        current = op_dist.mean(dim=0)          # [n_ops]
+
+        # Wasserstein-1 = sum |CDF_p − CDF_q|
+        diff_cdf = torch.abs(current.cumsum(0) - ref.cumsum(0))
+        emd      = diff_cdf.sum()
+
+        return -emd   # negative → minimise = maximise diversity
+
+    def _jsd_loss(self, T1: torch.Tensor, T2: torch.Tensor,
+                  own_mask: torch.Tensor) -> torch.Tensor:
+        """Jensen-Shannon divergence between T1 and T2 per output position.
+
+        Returns −mean(JSD)  (we want to *maximise* divergence).
+        """
+        eps = 1e-8
+        m   = 0.5 * (T1 + T2)                                     # [B, P, L]
+
+        kl1 = (T1 * (torch.log(T1 + eps) - torch.log(m + eps))).sum(dim=1)  # [B, L]
+        kl2 = (T2 * (torch.log(T2 + eps) - torch.log(m + eps))).sum(dim=1)  # [B, L]
+        jsd = 0.5 * (kl1 + kl2)                                   # [B, L]
+
+        valid  = own_mask.float()
+        n_valid = valid.sum().clamp(min=1.0)
+        jsd_mean = (jsd * valid).sum() / n_valid
+
+        return -jsd_mean
+
+    def _entropy_loss(self, T1: torch.Tensor, T2: torch.Tensor,
+                      own_mask: torch.Tensor) -> torch.Tensor:
+        """Mean column-wise entropy of T1 and T2 (both).
+
+        Maximise entropy → minimise negative entropy.  Returned as positive
+        value to be subtracted in the final loss.
+        """
+        eps    = 1e-8
+        valid  = own_mask.float()
+        n_valid = valid.sum().clamp(min=1.0)
+
+        def col_entropy(T):
+            H = -(T * torch.log(T + eps)).sum(dim=1)     # [B, L]
+            return (H * valid).sum() / n_valid
+
+        return (col_entropy(T1) + col_entropy(T2)) * 0.5
+
+    # ── Fingerprint tracking ─────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _update_fingerprint_buffer(self, T1, T2, lam, own_mask):
+        """Compute a batch fingerprint and store for epoch aggregation."""
+        # Average T1 and T2 for the fingerprint
+        T_avg   = (T1 + T2) * 0.5
+        op_dist = self._soft_op_dist(T_avg, own_mask)    # [B, n_ops]
+        fp      = op_dist.mean(dim=0).cpu().numpy()      # [n_ops]
+        self._epoch_fingerprints.append(fp)
+
+    def _end_of_epoch_update(self):
+        """Aggregate epoch fingerprints and push to sliding window."""
+        if self._epoch_fingerprints:
+            epoch_fp = np.stack(self._epoch_fingerprints, axis=0).mean(0)  # [n_ops]
+            self._strategy_window.append(epoch_fp)
+            self._epoch_fingerprints = []
+
+    # ── Training phases ───────────────────────────────────────────────────────
+
+    def _phase1_recommender(self, input_ids, target_pos, target_neg, epoch, batch_idx):
+        self.model.train()
+        self.adv_model.eval()
+        self.optim.zero_grad()
+
+        seq_out_orig = self.model.transformer_encoder(input_ids)
+        L_rec_orig   = self.cross_entropy(seq_out_orig, target_pos, target_neg)
+
+        # Two hard views (augmenter frozen)
+        with torch.no_grad():
+            _, _, hard1, hard2, lam, T1, T2, own_mask = self.adv_model.forward_dual(
+                input_ids, self.model.item_embeddings,
+                item_similarity=self.item_similarity,
+            )
+
+        lam_mean = lam.mean().detach()
+
+        # Record T matrix for visualisation (alternate T1 / T2)
+        if epoch % 5 == 0:
+            T_rec = T1 if batch_idx % 2 == 0 else T2
+            self.analyzer.record(T_rec, lam, own_mask, epoch)
+
+        # View-to-view contrastive
+        out1   = self.model.transformer_encoder_from_embeds(hard1, input_ids)
+        out2   = self.model.transformer_encoder_from_embeds(hard2, input_ids)
+        flat1  = out1.reshape(out1.shape[0], -1)
+        flat2  = out2.reshape(out2.shape[0], -1)
+        L_CL   = self.cf_criterion(flat1, flat2)
+
+        L_B = self.args.rec_weight * L_rec_orig + self.args.cf_weight * L_CL
+
+        L_B.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        self.optim.step()
+
+        return {
+            'L_rec_orig': L_rec_orig.item(),
+            'L_CL':       L_CL.item(),
+            'L_B':        L_B.item(),
+            'lam_mean':   lam_mean.item(),
+        }
+
+    def _phase2_augmenter(self, input_ids, target_pos, target_neg):
+        self.model.eval()
+        self.adv_model.train()
+        self.optim_adv.zero_grad()
+
+        for param in self.model.parameters():
+            param.requires_grad_(False)
+
+        # Soft dual views
+        soft1, soft2, _, _, lam, T1, T2, own_mask = self.adv_model.forward_dual(
+            input_ids, self.model.item_embeddings,
+            item_similarity=self.item_similarity,
+        )
+
+        # Info-preservation loss on view 1 (soft, gradients flow)
+        seq_aug1 = self.model.transformer_encoder_from_embeds(soft1, input_ids)
+        L_rec_aug = self.cross_entropy(
+            seq_aug1[:, -1:, :], target_pos[:, -1:], target_neg[:, -1:]
+        )
+
+        # Soft operation distributions for diversity losses
+        op_dist1 = self._soft_op_dist(T1, own_mask)   # [B, n_ops]
+        op_dist2 = self._soft_op_dist(T2, own_mask)   # [B, n_ops]
+        op_dist  = (op_dist1 + op_dist2) * 0.5         # average both heads
+
+        L_diversity = self._emd_loss(op_dist)
+        L_view_div  = self._jsd_loss(T1, T2, own_mask)
+        L_entropy   = self._entropy_loss(T1, T2, own_mask)
+
+        L_A = (self.beta       * L_rec_aug
+               + self.diversity_w * L_diversity
+               + self.view_div_w  * L_view_div
+               - self.entropy_w   * L_entropy)
+
+        L_A.backward()
+        torch.nn.utils.clip_grad_norm_(self.adv_model.parameters(), self.max_grad_norm)
+        self.optim_adv.step()
+
+        # Accumulate fingerprint for end-of-epoch update (detached)
+        self._update_fingerprint_buffer(
+            T1.detach(), T2.detach(), lam.detach(), own_mask.detach()
+        )
+
+        for param in self.model.parameters():
+            param.requires_grad_(True)
+
+        return {
+            'L_rec_aug':  L_rec_aug.item(),
+            'L_diversity': L_diversity.item(),
+            'L_view_div': L_view_div.item(),
+            'L_entropy':  L_entropy.item(),
+            'L_A':        L_A.item(),
+        }
+
+    # ── Main iteration ────────────────────────────────────────────────────────
+
+    def iteration(self, epoch, dataloader, full_sort=True, train=True):
+        str_code = "train" if train else "test"
+
+        if train:
+            self.model.train()
+            self.adv_model.train()
+
+            metrics = {
+                'L_rec_orig': 0.0, 'L_CL': 0.0, 'L_B': 0.0,
+                'lam_mean': 0.0,
+                'L_rec_aug': 0.0, 'L_diversity': 0.0,
+                'L_view_div': 0.0, 'L_entropy': 0.0, 'L_A': 0.0,
+            }
+
+            is_warmup        = epoch < self.warmup_epochs
+            rec_cf_data_iter = tqdm(enumerate(dataloader), total=len(dataloader))
+
+            for i, (rec_batch, cl_batches) in rec_cf_data_iter:
+                rec_batch  = tuple(t.to(self.device) for t in rec_batch)
+                _, input_ids, target_pos, target_neg, _ = rec_batch
+
+                if is_warmup:
+                    self.model.train()
+                    self.optim.zero_grad()
+                    seq_out  = self.model.transformer_encoder(input_ids)
+                    L_rec    = self.cross_entropy(seq_out, target_pos, target_neg)
+                    L_rec.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm
+                    )
+                    self.optim.step()
+                    metrics['L_rec_orig'] += L_rec.item()
+                    metrics['L_B']        += L_rec.item()
+
+                else:
+                    stats1 = self._phase1_recommender(
+                        input_ids, target_pos, target_neg, epoch, i
+                    )
+                    stats2 = self._phase2_augmenter(
+                        input_ids, target_pos, target_neg
+                    )
+                    for k, v in {**stats1, **stats2}.items():
+                        if k in metrics:
+                            metrics[k] += v
+
+                if i % 10 == 0:
+                    rec_cf_data_iter.set_description(
+                        f"Epoch {epoch} "
+                        f"{'[warmup]' if is_warmup else '[div]'}: "
+                        f"L_B={metrics['L_B']/(i+1):.4f} "
+                        f"L_A={metrics['L_A']/(i+1):.4f} "
+                        f"λ={metrics['lam_mean']/(i+1):.3f}"
+                    )
+
+            # Post-epoch: decay temperature and push fingerprint to window
+            if not is_warmup:
+                self.adv_model.decay_tau()
+                self._end_of_epoch_update()
+
+            num_batches = len(dataloader)
+            for k in metrics:
+                metrics[k] /= num_batches
+
+            post_fix = {
+                "epoch":       epoch,
+                "warmup":      is_warmup,
+                "L_rec_orig":  f"{metrics['L_rec_orig']:.4f}",
+                "L_CL":        f"{metrics['L_CL']:.4f}",
+                "L_B":         f"{metrics['L_B']:.4f}",
+                "lam_mean":    f"{metrics['lam_mean']:.4f}",
+                "L_rec_aug":   f"{metrics['L_rec_aug']:.4f}",
+                "L_diversity": f"{metrics['L_diversity']:.4f}",
+                "L_view_div":  f"{metrics['L_view_div']:.4f}",
+                "L_entropy":   f"{metrics['L_entropy']:.4f}",
+                "L_A":         f"{metrics['L_A']:.4f}",
+            }
+
+            if (epoch + 1) % self.args.log_freq == 0:
+                print(str(post_fix))
+            with open(self.args.log_file, 'a') as f:
+                f.write(str(post_fix) + '\n')
+
+        else:
+            rec_data_iter = tqdm(
+                enumerate(dataloader),
+                desc="Recommendation EP_%s:%d" % (str_code, epoch),
+                total=len(dataloader),
+                bar_format="{l_bar}{r_bar}"
+            )
+            self.model.eval()
+            pred_list = None
+
+            if full_sort:
+                answer_list = None
+                for i, batch in rec_data_iter:
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers = batch
+                    recommend_output = self.model.transformer_encoder(input_ids)
+                    recommend_output = recommend_output[:, -1, :]
+                    rating_pred      = self.predict_full(recommend_output)
+                    rating_pred      = rating_pred.cpu().data.numpy().copy()
+                    batch_user_index = user_ids.cpu().numpy()
+                    rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+                    ind            = np.argpartition(rating_pred, -20)[:, -20:]
+                    arr_ind        = rating_pred[np.arange(len(rating_pred))[:, None], ind]
+                    arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
+                    batch_pred_list = ind[
+                        np.arange(len(rating_pred))[:, None], arr_ind_argsort
+                    ]
+                    if i == 0:
+                        pred_list   = batch_pred_list
+                        answer_list = answers.cpu().data.numpy()
+                    else:
+                        pred_list   = np.append(pred_list,   batch_pred_list, axis=0)
+                        answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                return self.get_full_sort_score(epoch, answer_list, pred_list)
+
+            else:
+                for i, batch in rec_data_iter:
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers, sample_negs = batch
+                    recommend_output = self.model.finetune(input_ids)
+                    test_neg_items   = torch.cat((answers, sample_negs), -1)
+                    recommend_output = recommend_output[:, -1, :]
+                    test_logits      = self.predict_sample(recommend_output, test_neg_items)
+                    test_logits      = test_logits.cpu().detach().numpy().copy()
                     if i == 0:
                         pred_list = test_logits
                     else:

@@ -8,9 +8,9 @@ import argparse
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 from datasets import RecWithContrastiveLearningDataset
-from trainers import CoSeRecTrainer, ASTARTrainer
+from trainers import CoSeRecTrainer, ASTARTrainer, ASTARDiversityTrainer
 from models import SASRecModel, OfflineItemSimilarity, OnlineItemSimilarity
-from ASTAR import Augmenter
+from ASTAR import Augmenter, DualViewAugmenter
 from utils import EarlyStopping, get_user_seqs, check_path, set_seed
 
 
@@ -27,7 +27,20 @@ def show_args_info(args):
 def build_trainer(args, train_dataloader, eval_dataloader, test_dataloader):
     model = SASRecModel(args=args)
 
-    if args.model_name == 'ASTAR':
+    if args.model_name == 'ASTARDiversity':
+        args.tau = args.aug_tau
+        args.tau_decay = args.aug_tau_decay
+        args.min_tau = args.aug_min_tau
+        args.beta = args.astar_beta
+
+        adv_model = DualViewAugmenter(args, N_rand=args.N_rand, N_sim=args.N_sim, N_hist=args.N_hist)
+        trainer = ASTARDiversityTrainer(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args
+        )
+        print('Train ASTARDiversity')
+    elif args.model_name == 'ASTAR':
         # Pass ASTAR-specific args to augmenter
         args.tau = args.aug_tau
         args.tau_decay = args.aug_tau_decay
@@ -139,6 +152,18 @@ def main():
     parser.add_argument('--fixed_lambda_value', default=0.5, type=float,
                         help='used only when --lambda_mode fixed')
 
+    # Diversity ablation args (ASTARDiversity mode)
+    parser.add_argument('--strategy_window_size', default=10, type=int,
+                        help='sliding window size for strategy fingerprint history')
+    parser.add_argument('--diversity_weight', default=0.1, type=float,
+                        help='weight for temporal EMD diversity loss')
+    parser.add_argument('--view_div_weight', default=0.1, type=float,
+                        help='weight for JSD view divergence loss')
+    parser.add_argument('--entropy_weight', default=0.01, type=float,
+                        help='weight for column-wise entropy regularisation on T')
+    parser.add_argument('--use_film', action='store_true',
+                        help='apply FiLM modulation on h_own before T computation')
+
     args = parser.parse_args()
 
     check_path(args.output_dir)
@@ -179,9 +204,9 @@ def main():
     online_similarity_model = OnlineItemSimilarity(item_size=args.item_size)
     args.online_similarity_model = online_similarity_model
 
-    # ASTAR: precompute item similarity tensor for pool
+    # ASTAR / ASTARDiversity: precompute item similarity tensor for pool
     args.item_similarity = None
-    if args.model_name == 'ASTAR' and args.use_item_similarity and args.N_sim > 0:
+    if args.model_name in ('ASTAR', 'ASTARDiversity') and args.use_item_similarity and args.N_sim > 0:
         print("Precomputing item similarity tensor for ASTAR pool...")
         top_k = args.N_sim
         sim_matrix = []
