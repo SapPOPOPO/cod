@@ -505,3 +505,146 @@ class Augmenter(nn.Module):
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
+
+
+# ── FiLM helper ──────────────────────────────────────────────────────────────
+
+class FiLMBlock(nn.Module):
+    """Feature-wise Linear Modulation.
+
+    Modulates h [B, L, D] with conditioning vector c [B, D]:
+        h' = γ(c) ⊙ h + β(c)
+    where γ and β come from linear projections of c.
+    """
+
+    def __init__(self, D: int):
+        super().__init__()
+        self.gamma_proj = nn.Linear(D, D)
+        self.beta_proj  = nn.Linear(D, D)
+
+    def forward(self, h: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        h: [B, L, D]
+        c: [B, D]
+
+        Returns:
+            h' [B, L, D] — FiLM-modulated hidden states
+        """
+        gamma = self.gamma_proj(c).unsqueeze(1)  # [B, 1, D]
+        beta  = self.beta_proj(c).unsqueeze(1)   # [B, 1, D]
+        return gamma * h + beta
+
+
+# ── Dual-View Augmenter ───────────────────────────────────────────────────────
+
+class DualViewAugmenter(Augmenter):
+    """Augmenter with two independent cross-attention heads.
+
+    Produces two T matrices (T1 via Q_proj, T2 via Q_proj2) from a shared pool
+    and λ.  The two views are therefore encouraged to select different items
+    from the same candidate pool.
+
+    Optionally applies FiLM modulation on h_own before each Q projection
+    (controlled by ``args.use_film``, default False).
+    """
+
+    def __init__(
+        self,
+        args,
+        N_rand: int = 20,
+        N_sim:  int = 10,
+        N_hist: int = 0,
+    ):
+        super().__init__(args, N_rand=N_rand, N_sim=N_sim, N_hist=N_hist)
+
+        # Second query projection (shares K_pool and V_pool with parent)
+        self.Q_proj2 = nn.Linear(self.D, self.D)
+
+        # Optional FiLM blocks (one per head)
+        self.use_film = bool(getattr(args, 'use_film', False))
+        if self.use_film:
+            self.film1 = FiLMBlock(self.D)
+            self.film2 = FiLMBlock(self.D)
+
+        # Initialise newly added parameters
+        self.Q_proj2.apply(self.init_weights)
+        if self.use_film:
+            self.film1.apply(self.init_weights)
+            self.film2.apply(self.init_weights)
+
+    # ── Second T head ─────────────────────────────────────────────────────────
+
+    def compute_T2(
+        self,
+        h_own:     torch.Tensor,   # [B, L, D]  (may be FiLM-modulated)
+        K_pool:    torch.Tensor,   # [B, P, D]
+        pool_mask: torch.Tensor,   # [B, P]
+        own_mask:  torch.Tensor,   # [B, L]
+    ) -> torch.Tensor:
+        """Compute T2 using Q_proj2.  Identical structure to compute_T."""
+        B, L, D = h_own.shape
+
+        Q      = self.Q_proj2(h_own)                                      # [B, L, D]
+        scores = torch.bmm(Q, K_pool.transpose(1, 2)) / (D ** 0.5)       # [B, L, P]
+        scores = scores.masked_fill(
+            ~pool_mask.unsqueeze(1).expand_as(scores), -1e9
+        )
+        T = F.softmax(scores / self.tau, dim=-1)                          # [B, L, P]
+        T = T.transpose(1, 2)                                             # [B, P, L]
+        T = T * own_mask.unsqueeze(1).float()
+        return T
+
+    # ── Dual forward ──────────────────────────────────────────────────────────
+
+    def forward_dual(
+        self,
+        input_ids:                   torch.Tensor,
+        recommender_item_embeddings: nn.Embedding,
+        item_similarity:             Optional[torch.Tensor] = None,
+        user_history:                Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        soft_mixed1 [B, L, D]
+        soft_mixed2 [B, L, D]
+        hard_mixed1 [B, L, D]
+        hard_mixed2 [B, L, D]
+        lam         [B, L, 1]
+        T1          [B, P, L]
+        T2          [B, P, L]
+        own_mask    [B, L]
+        """
+        h_own, own_mask = self.encode(input_ids)
+        S = recommender_item_embeddings(input_ids)
+
+        K_pool, V_pool, pool_mask = self.build_pool(
+            input_ids, h_own, own_mask,
+            item_similarity=item_similarity,
+            user_history=user_history,
+        )
+
+        lam = self.compute_lambda(h_own, own_mask)
+
+        # Optionally apply FiLM before each head's Q projection
+        if self.use_film:
+            denom = own_mask.sum(dim=1, keepdim=True).clamp(min=1).float()  # [B,1]
+            c     = (h_own * own_mask.unsqueeze(-1).float()).sum(dim=1) / denom  # [B,D]
+            h1 = self.film1(h_own, c)
+            h2 = self.film2(h_own, c)
+        else:
+            h1 = h_own
+            h2 = h_own
+
+        T1 = self.compute_T(h1,  K_pool, pool_mask, own_mask)
+        T2 = self.compute_T2(h2, K_pool, pool_mask, own_mask)
+
+        soft_mixed1 = self.soft_augment(T1, V_pool, S, lam, own_mask)
+        soft_mixed2 = self.soft_augment(T2, V_pool, S, lam, own_mask)
+        hard_mixed1 = self.hard_augment(T1, V_pool, S, lam, own_mask)
+        hard_mixed2 = self.hard_augment(T2, V_pool, S, lam, own_mask)
+
+        return (soft_mixed1, soft_mixed2,
+                hard_mixed1, hard_mixed2,
+                lam, T1, T2, own_mask)
