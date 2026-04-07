@@ -86,7 +86,7 @@ def main():
     parser.add_argument('--training_data_ratio', default=1.0, type=float)
     parser.add_argument('--augment_threshold', default=5, type=int)
     parser.add_argument('--similarity_model_name', default='ItemCF_IUF', type=str)
-    parser.add_argument('--augmentation_warm_up_epoches', default=400, type=float)
+    parser.add_argument('--augmentation_warm_up_epoches', default=0, type=float)
     parser.add_argument('--base_augment_type', default='mask', type=str)
     parser.add_argument('--augment_type_for_short', default='SIM', type=str)
     parser.add_argument('--tao', default=0.2, type=float)
@@ -113,7 +113,7 @@ def main():
     # train args
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--epochs', default=15, type=int)
+    parser.add_argument('--epochs', default=6, type=int)
     parser.add_argument('--no_cuda', action='store_true')
     parser.add_argument('--log_freq', default=1, type=int)
     parser.add_argument('--seed', default=1, type=int)
@@ -131,7 +131,7 @@ def main():
                         help='augmenter adversarial weight')
     parser.add_argument('--astar_beta', default=50, type=float,
                         help='augmenter preservation weight')
-    parser.add_argument('--warmup_epochs', default=20, type=int,
+    parser.add_argument('--warmup_epochs', default=0, type=int,
                         help='epochs before adversarial game starts')
     parser.add_argument('--max_grad_norm', default=5.0, type=float)
     parser.add_argument('--aug_tau', default=2.0, type=float,
@@ -157,7 +157,7 @@ def main():
                         help='sliding window size for strategy fingerprint history')
     parser.add_argument('--diversity_weight', default=0.1, type=float,
                         help='weight for temporal EMD diversity loss')
-    parser.add_argument('--view_div_weight', default=0.5, type=float,
+    parser.add_argument('--view_div_weight', default=0.1, type=float,
                         help='weight for JSD view divergence loss')
     parser.add_argument('--entropy_weight', default=0.05, type=float,
                         help='weight for column-wise entropy regularisation on T')

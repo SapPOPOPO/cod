@@ -30,8 +30,6 @@ class Trainer:
         self.online_similarity_model = args.online_similarity_model
         self.total_augmentaion_pairs = nCr(self.args.n_views, 2)
 
-        self.analyzer = TMatrixAnalyzer(args, N_rand=args.N_rand, N_sim=args.N_sim)
-
         self.projection = nn.Sequential(
             nn.Linear(self.args.max_seq_length * self.args.hidden_size, 512, bias=False),
             nn.BatchNorm1d(512),
@@ -206,8 +204,6 @@ class ASTARTrainer(Trainer):
                 item_similarity=self.item_similarity,
             )
         lam_mean = lam.mean().detach()
-        if epoch % 5 == 0:
-            self.analyzer.record(T, lam, own_mask, epoch)
 
         # FIX: use hard_mixed in Phase-1 contrastive
         L_contrast = self._contrastive_from_embeds(soft_mixed, input_ids)
@@ -751,8 +747,7 @@ class ASTARDiversityTrainer(Trainer):
 
         # Record T matrix for visualisation (alternate T1 / T2)
         if epoch % 5 == 0:
-            T_rec = T1 if batch_idx % 2 == 0 else T2
-            self.analyzer.record(T_rec, lam, own_mask, epoch)
+            self.analyzer.record(T1, lam, own_mask, epoch, T2=T2)
 
         # View-to-view contrastive
         out1   = self.model.transformer_encoder_from_embeds(hard1, input_ids)
