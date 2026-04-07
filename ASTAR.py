@@ -330,6 +330,9 @@ class Augmenter(nn.Module):
         # Zero out padding output positions
         T = T * own_mask.unsqueeze(1).float()                       # [B, P, L]
 
+        if self.args.no_mask == True:
+            T[:, 0, :] = 0
+
         return T
 
     # ── Lambda ────────────────────────────────────────────────────────────────
@@ -561,7 +564,7 @@ class DualViewAugmenter(Augmenter):
         self.Q_proj2 = nn.Linear(self.D, self.D)
 
         # Optional FiLM blocks (one per head)
-        self.use_film = bool(getattr(args, 'use_film', False))
+        self.use_film = bool(getattr(args, 'use_film', True))
         if self.use_film:
             self.film1 = FiLMBlock(self.D)
             self.film2 = FiLMBlock(self.D)

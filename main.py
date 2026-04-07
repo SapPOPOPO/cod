@@ -113,7 +113,7 @@ def main():
     # train args
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=15, type=int)
     parser.add_argument('--no_cuda', action='store_true')
     parser.add_argument('--log_freq', default=1, type=int)
     parser.add_argument('--seed', default=1, type=int)
@@ -125,7 +125,7 @@ def main():
     parser.add_argument('--adam_beta2', default=0.999, type=float)
 
     # ASTAR-specific args
-    parser.add_argument('--reclp_weight', default=0.4, type=float,
+    parser.add_argument('--reclp_weight', default=0.0, type=float,
                         help='weight of last-position rec loss in recommender phase')
     parser.add_argument('--alpha', default=1.0, type=float,
                         help='augmenter adversarial weight')
@@ -138,9 +138,9 @@ def main():
                         help='initial augmenter temperature')
     parser.add_argument('--aug_tau_decay', default=0.99, type=float)
     parser.add_argument('--aug_min_tau', default=0.5, type=float)
-    parser.add_argument('--N_rand', default=5, type=int,
+    parser.add_argument('--N_rand', default=0, type=int,
                         help='number of random substitution candidates in pool')
-    parser.add_argument('--N_sim', default=0, type=int,
+    parser.add_argument('--N_sim', default=5, type=int,
                         help='number of similarity-based candidates in pool (0=disabled)')
     parser.add_argument('--N_hist', default=0, type=int,
                         help='number of user history candidates in pool (0=disabled)')
@@ -153,17 +153,18 @@ def main():
                         help='used only when --lambda_mode fixed')
 
     # Diversity ablation args (ASTARDiversity mode)
-    parser.add_argument('--strategy_window_size', default=10, type=int,
+    parser.add_argument('--strategy_window_size', default=2, type=int,
                         help='sliding window size for strategy fingerprint history')
     parser.add_argument('--diversity_weight', default=0.1, type=float,
                         help='weight for temporal EMD diversity loss')
-    parser.add_argument('--view_div_weight', default=0.1, type=float,
+    parser.add_argument('--view_div_weight', default=0.5, type=float,
                         help='weight for JSD view divergence loss')
-    parser.add_argument('--entropy_weight', default=0.01, type=float,
+    parser.add_argument('--entropy_weight', default=0.05, type=float,
                         help='weight for column-wise entropy regularisation on T')
     parser.add_argument('--use_film', action='store_true',
                         help='apply FiLM modulation on h_own before T computation')
-
+    parser.add_argument('--no_mask', action='store_true',
+                        help='no mask operations in T')
     args = parser.parse_args()
 
     check_path(args.output_dir)
@@ -250,6 +251,7 @@ def main():
         print(f"\n================ RUN {run_idx + 1}/{args.num_runs} | seed={run_seed} ================\n")
 
         trainer = build_trainer(args, train_dataloader, eval_dataloader, test_dataloader)
+        trainer.model.load_state_dict(torch.load("output/CoSeRec-Beauty-3.pt"))
 
         if args.do_eval:
             trainer.args.train_matrix = test_rating_matrix

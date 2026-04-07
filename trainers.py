@@ -588,6 +588,14 @@ class ASTARDiversityTrainer(Trainer):
             op_names.append('hist_sub')
         op_names += ['own_identity', 'own_shuffle']
         return own_start, op_names
+    
+    def _one_pair_contrastive_learning(self, inputs):
+        cl_batch = torch.cat(inputs, dim=0).to(self.device)
+        cl_sequence_output = self.model.transformer_encoder(cl_batch)
+        cl_sequence_flatten = cl_sequence_output.view(cl_batch.shape[0], -1)
+        batch_size = cl_batch.shape[0] // 2
+        cl_output_slice = torch.split(cl_sequence_flatten, batch_size)
+        return self.cf_criterion(cl_output_slice[0], cl_output_slice[1])
 
     # ── Soft operation proportions (differentiable) ───────────────────────────
 
@@ -668,23 +676,24 @@ class ASTARDiversityTrainer(Trainer):
         return -emd   # negative → minimise = maximise diversity
 
     def _jsd_loss(self, T1: torch.Tensor, T2: torch.Tensor,
-                  own_mask: torch.Tensor) -> torch.Tensor:
-        """Jensen-Shannon divergence between T1 and T2 per output position.
+                own_mask: torch.Tensor) -> torch.Tensor:
+        """JSD between per-sample operation distributions of T1 and T2.
 
-        Returns −mean(JSD)  (we want to *maximise* divergence).
+        Operates on the collapsed [B, n_ops] distribution (dense) rather than
+        the raw [B, P, L] transport matrix (sparse, causes vanishing gradients).
+        Returns -mean(JSD) — minimise to maximise divergence between heads.
         """
         eps = 1e-8
-        m   = 0.5 * (T1 + T2)                                     # [B, P, L]
 
-        kl1 = (T1 * (torch.log(T1 + eps) - torch.log(m + eps))).sum(dim=1)  # [B, L]
-        kl2 = (T2 * (torch.log(T2 + eps) - torch.log(m + eps))).sum(dim=1)  # [B, L]
-        jsd = 0.5 * (kl1 + kl2)                                   # [B, L]
+        d1 = self._soft_op_dist(T1, own_mask)   # [B, n_ops]
+        d2 = self._soft_op_dist(T2, own_mask)   # [B, n_ops]
+        m  = 0.5 * (d1 + d2)                    # [B, n_ops]
 
-        valid  = own_mask.float()
-        n_valid = valid.sum().clamp(min=1.0)
-        jsd_mean = (jsd * valid).sum() / n_valid
+        kl1 = (d1 * (torch.log(d1 + eps) - torch.log(m + eps))).sum(dim=-1)  # [B]
+        kl2 = (d2 * (torch.log(d2 + eps) - torch.log(m + eps))).sum(dim=-1)  # [B]
+        jsd = 0.5 * (kl1 + kl2)                 # [B],  in [0, log2]
 
-        return -jsd_mean
+        return -jsd.mean()
 
     def _entropy_loss(self, T1: torch.Tensor, T2: torch.Tensor,
                       own_mask: torch.Tensor) -> torch.Tensor:
@@ -723,7 +732,7 @@ class ASTARDiversityTrainer(Trainer):
 
     # ── Training phases ───────────────────────────────────────────────────────
 
-    def _phase1_recommender(self, input_ids, target_pos, target_neg, epoch, batch_idx):
+    def _phase1_recommender(self, input_ids, target_pos, target_neg, epoch, batch_idx, cl_batches):
         self.model.train()
         self.adv_model.eval()
         self.optim.zero_grad()
@@ -752,6 +761,13 @@ class ASTARDiversityTrainer(Trainer):
         flat2  = out2.reshape(out2.shape[0], -1)
         L_CL   = self.cf_criterion(flat1, flat2)
 
+        cl_losses = []
+        for cl_batch in cl_batches:
+            cl_loss = self._one_pair_contrastive_learning(cl_batch)
+            cl_losses.append(cl_loss)
+
+        cl_loss_sum = sum(self.args.cf_weight * cl_loss for cl_loss in cl_losses)
+
         L_B = self.args.rec_weight * L_rec_orig + self.args.cf_weight * L_CL
 
         L_B.backward()
@@ -762,6 +778,7 @@ class ASTARDiversityTrainer(Trainer):
             'L_rec_orig': L_rec_orig.item(),
             'L_CL':       L_CL.item(),
             'L_B':        L_B.item(),
+            'cl_loss_sum': cl_loss_sum.item(),
             'lam_mean':   lam_mean.item(),
         }
 
@@ -779,10 +796,14 @@ class ASTARDiversityTrainer(Trainer):
             item_similarity=self.item_similarity,
         )
 
-        # Info-preservation loss on view 1 (soft, gradients flow)
+        # Info-preservation loss on view 1 and 2 (soft, gradients flow)
         seq_aug1 = self.model.transformer_encoder_from_embeds(soft1, input_ids)
+        seq_aug2 = self.model.transformer_encoder_from_embeds(soft2, input_ids)
+
         L_rec_aug = self.cross_entropy(
             seq_aug1[:, -1:, :], target_pos[:, -1:], target_neg[:, -1:]
+        ) + self.cross_entropy(
+            seq_aug2[:, -1:, :], target_pos[:, -1:], target_neg[:, -1:]
         )
 
         # Soft operation distributions for diversity losses
@@ -794,10 +815,17 @@ class ASTARDiversityTrainer(Trainer):
         L_view_div  = self._jsd_loss(T1, T2, own_mask)
         L_entropy   = self._entropy_loss(T1, T2, own_mask)
 
+        # FIX: flatten before passing to NCELoss
+        flat_aug1  = seq_aug1.reshape(seq_aug1.shape[0], -1)
+        flat_aug2  = seq_aug2.reshape(seq_aug2.shape[0], -1)
+        L_contrast = self.cf_criterion(flat_aug1, flat_aug2)
+
         L_A = (self.beta       * L_rec_aug
                + self.diversity_w * L_diversity
                + self.view_div_w  * L_view_div
-               - self.entropy_w   * L_entropy)
+               - self.entropy_w   * L_entropy
+            #    - 0.1  * L_contrast
+               )
 
         L_A.backward()
         torch.nn.utils.clip_grad_norm_(self.adv_model.parameters(), self.max_grad_norm)
@@ -817,6 +845,7 @@ class ASTARDiversityTrainer(Trainer):
             'L_view_div': L_view_div.item(),
             'L_entropy':  L_entropy.item(),
             'L_A':        L_A.item(),
+            'L_contrast': L_contrast.item(),
         }
 
     # ── Main iteration ────────────────────────────────────────────────────────
@@ -857,7 +886,8 @@ class ASTARDiversityTrainer(Trainer):
 
                 else:
                     stats1 = self._phase1_recommender(
-                        input_ids, target_pos, target_neg, epoch, i
+                        input_ids, target_pos, target_neg, epoch, i, 
+                        cl_batches
                     )
                     stats2 = self._phase2_augmenter(
                         input_ids, target_pos, target_neg
