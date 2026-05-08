@@ -50,6 +50,7 @@ def parse_args():
     p.add_argument("--attention_probs_dropout_prob", type=float, default=0.5)
     p.add_argument("--initializer_range", type=float, default=0.02)
     p.add_argument("--hidden_act", type=str, default="gelu")
+    p.add_argument("--no_cuda", action="store_true")
 
     p.add_argument("--n_sim_candidates", type=int, default=10)
     p.add_argument("--n_rand_candidates", type=int, default=20)
@@ -91,6 +92,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "viz"), exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.cuda_condition = torch.cuda.is_available() and not getattr(args, "no_cuda", False)
+
 
     from utils import get_user_seqs
     args.data_file = os.path.join(args.data_dir, f"{args.data_name}.txt")
