@@ -1,0 +1,21 @@
+#!/bin/bash
+python main_v2.py \
+    --data_name Beauty \
+    --data_dir data/ \
+    --output_dir output/beauty_v2/ \
+    --epochs 200 \
+    --batch_size 256 \
+    --max_seq_length 50 \
+    --hidden_size 64 \
+    --rec_lr 1e-3 \
+    --aug_lr 2e-4 \
+    --beta 1.0 \
+    --gamma 1.0 \
+    --eta_op 0.01 \
+    --eta_tg 0.01 \
+    --delta_max 0.5 \
+    --edit_target_start 0.1 \
+    --edit_target_end 0.3 \
+    --edit_target_warmup_epochs 10 \
+    --viz_every 5 \
+    --seed 42
