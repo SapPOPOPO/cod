@@ -32,8 +32,8 @@ def train_one_step(*, batch, augmenter, recommender, ema_recommender,
 
     target_edit = cfg.edit_target_schedule(cfg.current_epoch)
     bud_loss = 0.5 * (
-        budget_loss(out_v1["edit_mask"], out_v1["own_mask"], target_edit)
-        + budget_loss(out_v2["edit_mask"], out_v2["own_mask"], target_edit)
+        budget_loss(out_v1["op_probs"], out_v1["own_mask"], target_edit)
+        + budget_loss(out_v2["op_probs"], out_v2["own_mask"], target_edit)
     )
 
     ent_op = 0.5 * (

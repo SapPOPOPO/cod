@@ -33,11 +33,19 @@ def semantic_anchor_loss(
     return F.relu(mean_dist - delta_max)
 
 
-def budget_loss(edit_mask: torch.Tensor, own_mask: torch.Tensor, target: float) -> torch.Tensor:
+def budget_loss(op_probs: torch.Tensor, own_mask: torch.Tensor, target: float) -> torch.Tensor:
+    """Differentiable budget: E[edit_fraction] = sum of non-KEEP op probs.
+
+    op_probs:  [B, L, K]   softmax over ops
+    own_mask:  [B, L]      bool/float, valid positions
+    target:    float       desired edit fraction in [0, 1]
+    """
     valid = own_mask.float()
     n_valid = valid.sum().clamp(min=1.0)
-    edit_frac = (edit_mask.float() * valid).sum() / n_valid
-    return (edit_frac - target).pow(2)
+    # P(edit | position) = 1 - P(KEEP | position)
+    p_edit = 1.0 - op_probs[..., OP_KEEP]                      # [B, L]
+    expected_edit_frac = (p_edit * valid).sum() / n_valid       # scalar, differentiable
+    return (expected_edit_frac - target).pow(2)
 
 
 def policy_entropy(probs: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
