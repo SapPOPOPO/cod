@@ -50,3 +50,8 @@ class RecommenderWrapper(nn.Module):
             -torch.log(1 - torch.sigmoid(neg_logits) + 1e-24) * istarget
         ) / istarget.sum().clamp(min=1.0)
         return loss
+    
+    def forward_from_embeddings(self, item_embs, input_ids):
+        """Run encoder from precomputed [B, L, D] embeddings; returns [B, D] last-pos."""
+        h = self.base.transformer_encoder_from_embeds(item_embs, input_ids)   # [B, L, D]
+        return h[:, -1, :]
