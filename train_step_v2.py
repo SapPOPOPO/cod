@@ -24,10 +24,8 @@ def train_one_step(*, batch, augmenter, recommender, ema_recommender,
     z2 = ema_recommender.module.forward_from_embeddings(out_v2["aug_emb"], out_v2["aug_ids"])
     diff_loss = info_nce(z1, z2, temperature=cfg.contrastive_temp)
 
-    sem1 = semantic_anchor_loss(input_ids, out_v1["aug_ids"], out_v1["chosen_op"],
-                                sim_lookup, out_v1["own_mask"], delta_max=cfg.delta_max)
-    sem2 = semantic_anchor_loss(input_ids, out_v2["aug_ids"], out_v2["chosen_op"],
-                                sim_lookup, out_v2["own_mask"], delta_max=cfg.delta_max)
+    sem1 = semantic_anchor_loss(input_ids, out_v1, sim_lookup, delta_max=cfg.delta_max)
+    sem2 = semantic_anchor_loss(input_ids, out_v2, sim_lookup, delta_max=cfg.delta_max)
     sem_loss = 0.5 * (sem1 + sem2)
 
     target_edit = cfg.edit_target_schedule(cfg.current_epoch)

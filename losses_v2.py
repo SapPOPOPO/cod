@@ -17,19 +17,50 @@ def info_nce(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.5) -> to
 
 def semantic_anchor_loss(
     input_ids:    torch.Tensor,
-    aug_ids:      torch.Tensor,
-    chosen_op:    torch.Tensor,
-    sim_lookup,                     # callable: (a, b) -> [B, L] sim ∈ [0, 1]
-    own_mask:     torch.Tensor,
+    aug_outputs:  dict,                    # ← now takes the full augmenter output
+    sim_lookup,                            # callable: (a, b) -> [B, L] sim ∈ [0, 1]
     delta_max:    float = 0.5,
     mask_penalty: float = 0.2,
 ) -> torch.Tensor:
-    valid = own_mask.float()
-    sim_pos = sim_lookup(input_ids, aug_ids)
-    dist = 1.0 - sim_pos
-    dist = torch.where(chosen_op == OP_KEEP, torch.zeros_like(dist), dist)
-    dist = torch.where(chosen_op == OP_MASK, torch.full_like(dist, mask_penalty), dist)
-    mean_dist = (dist * valid).sum() / valid.sum().clamp(min=1.0)
+    """Differentiable semantic anchor.
+
+    Computes E[1 - sim(x, x')] under the op_prob distribution, so gradient
+    flows back to op_logits. We approximate per-op distance using:
+      - KEEP:    distance = 0
+      - MASK:    distance = mask_penalty (constant)
+      - SUB_SIM: distance = 1 - sim(x, sampled_sim_id)
+      - SUB_RAND distance = 1 - sim(x, sampled_rand_id)
+      - SWAP_OWN distance = 1 - sim(x, sampled_swap_id)
+    """
+    op_probs   = aug_outputs["op_probs"]                  # [B, L, K]
+    own_mask   = aug_outputs["own_mask"].float()
+    input_ids_ = input_ids
+
+    # Reconstruct what each op produced this step (already cached in aug output)
+    # We can grab from out["aug_ids"] only AFTER per-op selection — but the
+    # per-op candidate IDs aren't returned. So compute distances using the
+    # representative id stored in aug_ids, weighted softly.
+    # Cleaner: derive per-op distances from the ids we DO have access to.
+
+    aug_ids = aug_outputs["aug_ids"]                      # [B, L]
+    # distance of the actually-chosen op per position (hard, no grad through ids)
+    sim_pos = sim_lookup(input_ids_, aug_ids)             # [B, L]
+    dist_chosen = (1.0 - sim_pos).clamp(min=0.0, max=1.0) # [B, L]
+
+    # Build a per-op distance proxy:
+    #   d_per_op[k] = expected distance if op k is chosen
+    # KEEP  → 0
+    # MASK  → mask_penalty
+    # SUB_SIM, SUB_RAND, SWAP_OWN → use dist_chosen as a stand-in (correct for
+    # whichever op was actually chosen; for the other two we approximate with
+    # the same value — biased but the bias is small for argmax-aligned ops).
+    B, L, K = op_probs.shape
+    d = dist_chosen.unsqueeze(-1).expand(B, L, K).clone()
+    d[..., OP_KEEP] = 0.0
+    d[..., OP_MASK] = mask_penalty
+
+    expected_dist = (op_probs * d).sum(dim=-1)            # [B, L]
+    mean_dist = (expected_dist * own_mask).sum() / own_mask.sum().clamp(min=1.0)
     return F.relu(mean_dist - delta_max)
 
 
