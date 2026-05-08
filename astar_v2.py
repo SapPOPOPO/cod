@@ -52,7 +52,11 @@ class DiscretePolicyAugmenter(nn.Module):
         self.L = args.max_seq_length
         self.num_items = args.item_size
 
-        self._shared_item_table = recommender_item_embeddings
+        # ── CRITICAL: bypass nn.Module.__setattr__ to avoid registering B's
+        #    embedding table as a submodule of A. Otherwise A's optimizer
+        #    would silently train B's item embeddings.
+        object.__setattr__(self, "_shared_item_table", recommender_item_embeddings)
+
         self.mask_token_id = mask_token_id
         self.n_sim_candidates = n_sim_candidates
         self.n_rand_candidates = n_rand_candidates
@@ -69,6 +73,11 @@ class DiscretePolicyAugmenter(nn.Module):
         self.swap_key_proj = nn.Linear(self.D, self.D)
 
         self.apply(self._init_weights)
+
+    def _embed_with_shared_table(self, ids: torch.Tensor) -> torch.Tensor:
+        # Read B's table without registering it / without coupling gradients.
+        weight = self._shared_item_table.weight.detach()
+        return F.embedding(ids, weight, padding_idx=0)
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -128,14 +137,14 @@ class DiscretePolicyAugmenter(nn.Module):
         else:
             target_onehot = F.one_hot(swap_scores.argmax(-1), L).float()
 
-        # ── Build candidate ids per op ──────────────────────────────────────
+                # ── Build candidate ids per op (discrete, on-manifold) ──────────────
         ids_keep = input_ids
         ids_mask = torch.full_like(input_ids, self.mask_token_id)
 
         if sim_topk_idx is not None and self.n_sim_candidates > 0:
             top_k = sim_topk_idx.size(1)
             k_pick = min(self.n_sim_candidates, top_k)
-            cand = sim_topk_idx[input_ids.clamp(min=0)][..., :k_pick]   # [B, L, k_pick]
+            cand = sim_topk_idx[input_ids.clamp(min=0)][..., :k_pick]
             pick_idx = torch.randint(0, k_pick, (B, L, 1), device=input_ids.device)
             ids_sim = cand.gather(-1, pick_idx).squeeze(-1)
         else:
@@ -150,11 +159,37 @@ class DiscretePolicyAugmenter(nn.Module):
         chosen_op = op_onehot.argmax(-1)
         aug_ids = all_ids.gather(-1, chosen_op.unsqueeze(-1)).squeeze(-1)
         aug_ids = aug_ids * own_mask.long()
-
         edit_mask = (chosen_op != OP_KEEP) & own_mask
+
+        # ── Build STE embeddings (this is what we actually feed to B/EMA-B) ─
+        # Read all candidate embeddings from B's table (stop-grad on weights).
+        E = self._shared_item_table.weight.detach()              # [V, D]
+        mask_emb = E[self.mask_token_id]                         # [D]
+
+        E_keep = F.embedding(ids_keep, E, padding_idx=0)         # [B, L, D]
+        E_mask = mask_emb.view(1, 1, -1).expand(B, L, -1)
+        E_sim  = F.embedding(ids_sim,  E, padding_idx=0)
+        E_rand = F.embedding(ids_rand, E, padding_idx=0)
+
+        # SWAP: differentiable via target_onehot (Gumbel-softmax STE on target)
+        # Per-position sum over targets, weighted by target_onehot.
+        E_seq = F.embedding(input_ids, E, padding_idx=0)         # [B, L, D]
+        E_swap = torch.bmm(target_onehot, E_seq)                 # [B, L, D]
+
+        # Soft mixture over ops, weighted by op_onehot (differentiable).
+        E_stack = torch.stack([E_keep, E_mask, E_sim, E_rand, E_swap], dim=2)  # [B, L, K, D]
+        aug_emb_soft = (op_onehot.unsqueeze(-1) * E_stack).sum(dim=2)          # [B, L, D]
+
+        # Hard discrete embedding (on-manifold) — what B actually consumes in forward
+        aug_emb_hard = F.embedding(aug_ids, E, padding_idx=0)                  # [B, L, D]
+
+        # Straight-through: forward = hard, backward = soft
+        aug_emb = aug_emb_hard + (aug_emb_soft - aug_emb_soft.detach())
+        aug_emb = aug_emb * own_mask.float().unsqueeze(-1)
 
         return {
             "aug_ids":       aug_ids,
+            "aug_emb":       aug_emb,           # ← USE THIS for the adversarial path
             "op_probs":      op_probs,
             "op_onehot":     op_onehot,
             "op_logits":     op_logits,

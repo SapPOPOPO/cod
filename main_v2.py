@@ -3,9 +3,10 @@
 import os, argparse, torch
 from torch.utils.data import DataLoader
 
+import matplotlib.pyplot as plt
 # === REPLACE with your actual ports ===
 from datasets import SASRecDataset as SeqRecDataset           # your dataset class
-from models   import SASRecModel    as Recommender           # your SASRec
+from recommender_adapter import RecommenderWrapper as Recommender
 from generate_similarity import ItemCFBasedSimilarity as OfflineItemSimilarity
 # =======================================
 
@@ -22,6 +23,17 @@ from viz_v2 import (
 )
 from evaluate import evaluate
 
+def adapt_batch(batch_tuple, device):
+    """SASRecDataset returns (user_id, input_ids, target_pos, target_neg, answer)."""
+    batch_tuple = tuple(t.to(device) for t in batch_tuple)
+    user_id, input_ids, target_pos, target_neg, answer = batch_tuple
+    return {
+        "user_id":    user_id,
+        "input_ids":  input_ids,
+        "target_pos": target_pos,
+        "target_neg": target_neg,
+        "answer":     answer,
+    }
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -85,11 +97,20 @@ def main():
     user_seq, _, _, args.train_matrix = get_user_seqs(args.data_file)
 
     # ── Data ──────────────────────────────────────────────────────────────
+    from utils import get_user_seqs
+
+    args.data_file = os.path.join(args.data_dir, f"{args.data_name}.txt")
+    user_seq, max_item, valid_rating_matrix, test_rating_matrix = get_user_seqs(args.data_file)
+
+    args.item_size = max_item + 2          # +2: pad(0) + buffer; matches original main.py
+    args.mask_id = 0                       # original convention
+    args.train_matrix = valid_rating_matrix  # used by evaluate.py to mask seen items
+
     train_set = SeqRecDataset(args, user_seq, data_type="train")
-    valid_set = SeqRecDataset(args, user_seq,data_type="valid")
-    args.item_size = train_set.item_size  # ensure populated
+    valid_set = SeqRecDataset(args, user_seq, data_type="valid")
+
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_set, batch_size=args.batch_size)
+    valid_loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False)
 
     # ── Sim model ─────────────────────────────────────────────────────────
     sim_model = OfflineItemSimilarity(
@@ -134,11 +155,30 @@ def main():
     best_ndcg, best_epoch = -1.0, -1
     table_drift_history = []
 
+    n_aug = sum(p.numel() for p in augmenter.parameters())
+    n_rec = sum(p.numel() for p in recommender.parameters())
+    shared = sum(p.numel() for p in augmenter.parameters() if any(p is q for q in recommender.parameters()))
+    print(f"augmenter params: {n_aug:,}")
+    print(f"recommender params: {n_rec:,}")
+    print(f"params shared (must be 0): {shared}")
+
     for epoch in range(args.epochs):
         cfg.current_epoch = epoch
         recommender.train(); augmenter.train()
         for batch in train_loader:
-            batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            # SASRecDataset returns tuple: (user_id, input_ids, target_pos, target_neg, answer)
+            if isinstance(batch, (list, tuple)):
+                user_id, input_ids, target_pos, target_neg, answer = batch[:5]
+                batch = {
+                    "user_id":    user_id.to(device)    if torch.is_tensor(user_id)    else user_id,
+                    "input_ids":  input_ids.to(device),
+                    "target_pos": target_pos.to(device),
+                    "target_neg": target_neg.to(device),
+                    "answer":     answer.to(device)     if torch.is_tensor(answer)     else answer,
+                }
+            else:
+                batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
             train_one_step(
                 batch=batch, augmenter=augmenter,
                 recommender=recommender, ema_recommender=ema_recommender,
@@ -147,10 +187,9 @@ def main():
                 stats=stats, cfg=cfg,
             )
 
-        scores, post_fix = evaluate(recommender, valid_loader, args,
-                            epoch=epoch, full_sort=True, mode="valid")
+        scores, post_fix = evaluate(recommender, valid_loader, args, mode="valid")
         ndcg = scores[3]   # NDCG@10
-        hr   = scores[2]   # HIT@10
+        hr   = scores[2]   # HR@10
         print(post_fix)
 
         if ndcg > best_ndcg:
@@ -182,6 +221,7 @@ def main():
             plot_semantic_distance_hist(stats).savefig(f"{d}/sem_dist.png")
             plot_view_diversity(stats).savefig(f"{d}/view_div.png")
             plot_table_drift(table_drift_history).savefig(f"{d}/table_drift.png")
+            plt.close("all")
         stats.reset()
 
     print(f"best valid NDCG={best_ndcg:.4f} @ epoch {best_epoch}")

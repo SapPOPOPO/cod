@@ -19,9 +19,9 @@ def train_one_step(*, batch, augmenter, recommender, ema_recommender,
     out_v1 = augmenter(input_ids, sim_topk_idx=sim_topk_idx)
     out_v2 = augmenter(input_ids, sim_topk_idx=sim_topk_idx)
 
-    # Forward EMA-B with grad on inputs (gumbel-softmax provides path to A)
-    z1 = ema_recommender.module(out_v1["aug_ids"])
-    z2 = ema_recommender.module(out_v2["aug_ids"])
+    # Use STE embeddings so gradient flows from diff_loss back to A
+    z1 = ema_recommender.module.forward_from_embeddings(out_v1["aug_emb"])
+    z2 = ema_recommender.module.forward_from_embeddings(out_v2["aug_emb"])
     diff_loss = info_nce(z1, z2, temperature=cfg.contrastive_temp)
 
     sem1 = semantic_anchor_loss(input_ids, out_v1["aug_ids"], out_v1["chosen_op"],

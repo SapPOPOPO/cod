@@ -60,3 +60,58 @@ def target_entropy_when_swap(
 def augmenter_total_loss(*, diff_loss, sem_loss, bud_loss, ent_op, ent_target,
                          beta=1.0, gamma=1.0, eta_op=0.01, eta_tg=0.01):
     return -diff_loss + beta * sem_loss + gamma * bud_loss - eta_op * ent_op - eta_tg * ent_target
+
+def expected_budget_loss(op_probs: torch.Tensor, own_mask: torch.Tensor, target: float) -> torch.Tensor:
+    """Differentiable: expected edit fraction = mean over positions of P(op != KEEP)."""
+    p_edit = 1.0 - op_probs[..., 0]                          # [B, L]
+    valid = own_mask.float()
+    expected_frac = (p_edit * valid).sum() / valid.sum().clamp(min=1.0)
+    return (expected_frac - target).pow(2)
+
+
+def expected_semantic_loss(
+    input_ids:    torch.Tensor,        # [B, L]
+    ids_per_op:   torch.Tensor,        # [B, L, K]
+    op_probs:     torch.Tensor,        # [B, L, K]
+    target_probs: torch.Tensor,        # [B, L, L]   for SWAP_OWN
+    sim_lookup,
+    own_mask:     torch.Tensor,
+    delta_max:    float = 0.5,
+    mask_penalty: float = 0.2,
+) -> torch.Tensor:
+    """
+    Differentiable expected semantic distance under the policy.
+
+    For each op k:
+        d_k(j) = expected (1 - sim) under that op's substitution choice.
+
+    Then E[d|j] = sum_k op_probs[j,k] * d_k(j).
+    """
+    # KEEP: distance 0
+    d_keep = torch.zeros_like(op_probs[..., 0])
+    # MASK: fixed penalty
+    d_mask = torch.full_like(d_keep, mask_penalty)
+    # SUB_SIM, SUB_RAND: lookup vs the sampled candidate (not differentiable through choice
+    #   of similar/random candidate, but that randomness isn't policy-controlled anyway)
+    ids_sim  = ids_per_op[..., 2]
+    ids_rand = ids_per_op[..., 3]
+    d_sim  = 1.0 - sim_lookup(input_ids, ids_sim)
+    d_rand = 1.0 - sim_lookup(input_ids, ids_rand)
+
+    # SWAP_OWN: differentiable through target_probs.
+    #   d_swap(j) = sum_k target_probs[j,k] * (1 - sim(input[j], input[k]))
+    B, L = input_ids.shape
+    # Pairwise similarity input_ids[:, j] vs input_ids[:, k]
+    a = input_ids.unsqueeze(2).expand(B, L, L)        # [B, L, L]
+    b = input_ids.unsqueeze(1).expand(B, L, L)
+    sim_pair = sim_lookup(a.reshape(B, L * L), b.reshape(B, L * L)).view(B, L, L)
+    d_swap_per_target = 1.0 - sim_pair
+    d_swap = (target_probs * d_swap_per_target).sum(dim=-1)   # [B, L]
+
+    # Stack and combine
+    d_stack = torch.stack([d_keep, d_mask, d_sim, d_rand, d_swap], dim=-1)   # [B, L, K]
+    expected_d = (op_probs * d_stack).sum(dim=-1)                            # [B, L]
+
+    valid = own_mask.float()
+    mean_d = (expected_d * valid).sum() / valid.sum().clamp(min=1.0)
+    return F.relu(mean_d - delta_max)
