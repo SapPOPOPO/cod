@@ -189,7 +189,7 @@ class DiscretePolicyAugmenter(nn.Module):
 
         return {
             "aug_ids":       aug_ids,
-            "aug_emb":       aug_emb,           # ← USE THIS for the adversarial path
+            "aug_emb":       aug_emb,
             "op_probs":      op_probs,
             "op_onehot":     op_onehot,
             "op_logits":     op_logits,
@@ -200,4 +200,6 @@ class DiscretePolicyAugmenter(nn.Module):
             "edit_mask":     edit_mask,
             "own_mask":      own_mask,
             "h_own":         h_own,
+            # NEW: per-op candidate ids so semantic loss can compute exact per-op distances
+            "ids_per_op":    all_ids,   # [B, L, K]   K=5 ops
         }
