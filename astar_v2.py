@@ -116,6 +116,10 @@ class DiscretePolicyAugmenter(nn.Module):
 
         # ── Stage 1: op distribution ────────────────────────────────────────
         op_logits = self.op_head(h_own)
+        op_logits = op_logits.clone()
+        op_logits[..., OP_MASK]     = -1e9
+        op_logits[..., OP_SUB_RAND] = -1e9
+        op_probs = F.softmax(op_logits, dim=-1)
         op_probs = F.softmax(op_logits, dim=-1)
         if sample:
             op_onehot = F.gumbel_softmax(op_logits, tau=self.gumbel_tau, hard=True, dim=-1)

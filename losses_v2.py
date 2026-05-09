@@ -20,7 +20,7 @@ def semantic_anchor_loss(
     aug_outputs:  dict,
     sim_lookup,
     delta_max:    float = 0.5,
-    mask_penalty: float = 0.2,
+    mask_penalty: float = 0.8,
 ) -> torch.Tensor:
     """Differentiable semantic anchor with EXACT per-op distances.
 
