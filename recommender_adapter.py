@@ -10,7 +10,21 @@ class RecommenderWrapper(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.base = _BaseSASRec(args)
-        self.item_embeddings = self.base.item_embeddings   # expose for augmenter sharing
+        self.item_embeddings = self.base.item_embeddings
+        # CoSeRec-style projection head, applied only on the contrastive path
+        proj_in = args.max_seq_length * args.hidden_size
+        self.cl_projection = nn.Sequential(
+            nn.Linear(proj_in, 512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, args.hidden_size, bias=True),
+        )
+
+    def forward(self, input_ids):
+        """Contrastive path: flatten [B, L, D] -> projection -> [B, D]."""
+        h = self.base.transformer_encoder(input_ids)        # [B, L, D]
+        flat = h.view(h.size(0), -1)                        # [B, L*D]
+        return self.cl_projection(flat)     
 
     def transformer_encoder(self, input_ids):
         """Passthrough so evaluate.py keeps working."""
@@ -20,11 +34,6 @@ class RecommenderWrapper(nn.Module):
         h = self.base.transformer_encoder(input_ids)
         own_mask = (input_ids > 0)
         return h, own_mask
-
-    def forward(self, input_ids):
-        """Last-position pooled feature [B, D] for InfoNCE."""
-        h = self.base.transformer_encoder(input_ids)
-        return h[:, -1, :]
 
     def next_item_loss(self, batch):
         """CoSeRec-style BCE — identical to Trainer.cross_entropy in your original code."""
@@ -52,6 +61,6 @@ class RecommenderWrapper(nn.Module):
         return loss
     
     def forward_from_embeddings(self, item_embs, input_ids):
-        """Run encoder from precomputed [B, L, D] embeddings; returns [B, D] last-pos."""
-        h = self.base.transformer_encoder_from_embeds(item_embs, input_ids)   # [B, L, D]
-        return h[:, -1, :]
+        h = self.base.transformer_encoder_from_embeds(item_embs, input_ids)
+        flat = h.view(h.size(0), -1)
+        return self.cl_projection(flat)
